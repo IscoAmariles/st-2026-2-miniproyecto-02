@@ -4,13 +4,17 @@ Se corre de principio a fin con
 
     python miniproyecto.py
 
-y deja las figuras en figuras/ y las tablas en resultados/. Las partes
-marcadas con TODO las completa el grupo; mientras falten, el guion las
-reporta como pendientes y sigue. El informe, docs/informe.md, cita las cifras
-y las figuras que produce este guion.
+y deja las figuras en figuras/ y las tablas en resultados/. El informe,
+docs/informe.md, cita las cifras y las figuras que produce este guion.
+
+Serie del grupo: uso mensual de tarjetas débito en el comercio minorista de
+Islandia, enero de 2000 a agosto de 2013 (164 meses). Ficha en datos/README.md.
+El modelo a superar es el mejor del miniproyecto 1: SARIMAX(2,1,0)(0,1,1)12
+con los días hábiles del mes como exógena.
 """
 import time
 import warnings
+from functools import lru_cache
 
 import matplotlib
 
@@ -25,6 +29,7 @@ from sklearn.neighbors import KNeighborsRegressor  # noqa: E402
 from sklearn.pipeline import make_pipeline  # noqa: E402
 from sklearn.preprocessing import StandardScaler  # noqa: E402
 from sklearn.svm import SVR  # noqa: E402
+from statsmodels.tsa.seasonal import STL  # noqa: E402
 from statsmodels.tsa.statespace.sarimax import SARIMAX  # noqa: E402
 from torch import nn  # noqa: E402
 from xgboost import XGBRegressor  # noqa: E402
@@ -43,6 +48,20 @@ RESULTADOS.mkdir(exist_ok=True)
 SEMILLA = 2026
 N_PRUEBA = 24          # los meses del backtest, los mismos de comun.backtest
 
+# Estilo de las figuras: trazos delgados, cuadrícula tenue y los colores de
+# las series siempre en el mismo orden (azul, naranja, aqua).
+AZUL, NARANJA, AQUA = "#257de0", "#f47230", "#00b894"
+TINTA, TINTA_SUAVE = "#191919", "#666666"
+plt.rcParams.update({
+    "axes.prop_cycle": matplotlib.cycler(color=[AZUL, NARANJA, AQUA, "#f2a600"]),
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.edgecolor": "#999999", "axes.labelcolor": TINTA,
+    "axes.titlesize": 11, "axes.titleweight": "bold", "axes.titlelocation": "left",
+    "axes.grid": True, "grid.color": "#e5e5e5", "grid.linewidth": 0.8,
+    "xtick.color": TINTA_SUAVE, "ytick.color": TINTA_SUAVE,
+    "lines.linewidth": 1.8, "legend.frameon": False, "font.size": 9,
+})
+
 # El último modelo que ajustó cada función modelo(entrenamiento, h). Sirve
 # para contar sus parámetros después del backtest.
 ULTIMO = {}
@@ -50,44 +69,162 @@ ULTIMO = {}
 # ============================================================
 # 1. La serie y el modelo a superar
 # ============================================================
-# TODO: los mismos datos del miniproyecto 1: copie la serie a datos/ con su
-# ficha en datos/README.md y cambie estos cuatro datos. La serie de ejemplo
-# solo sirve para probar que el guion corre.
-ARCHIVO = "datos/air_passengers.csv"
-FECHA = "Month"
-VALOR = "#Passengers"
+# La misma serie del miniproyecto 1, con su ficha en datos/README.md.
+ARCHIVO = "datos/debito_islandia.csv"
+FECHA = "fecha"
+VALOR = "uso_debito"
 PERIODO = 12
+
+# Umbral del miniproyecto 1 para marcar un mes como atípico: residuo de la
+# STL robusta mayor que UMBRAL veces la desviación robusta (1.4826 * MAD).
+UMBRAL = 3.0
+
+
+def detectar_atipicos(serie):
+    """Meses cuyo residuo de la STL robusta supera UMBRAL desviaciones robustas."""
+    residuo = STL(serie, period=PERIODO, robust=True).fit().resid
+    escala = 1.4826 * np.median(np.abs(residuo - np.median(residuo)))
+    z = (residuo - np.median(residuo)) / escala
+    return pd.DataFrame({"valor": serie[np.abs(z) > UMBRAL],
+                         "residuo": residuo[np.abs(z) > UMBRAL],
+                         "z": z[np.abs(z) > UMBRAL]})
 
 
 def preparar(serie):
-    """TODO: la misma preparación del miniproyecto 1 (huecos y datos atípicos).
+    """La misma decisión del miniproyecto 1 sobre huecos y datos atípicos.
 
-    Debe devolver una serie sin NaN.
+    - Huecos: un mes vacío se rellena por interpolación lineal en el tiempo.
+      La serie de Islandia no trae ninguno, pero la regla queda en el código.
+    - Atípicos: se detectan con el residuo de una STL robusta y se imprimen,
+      pero NO se modifican: son meses reales (la crisis bancaria de 2008 y
+      meses con más o menos días hábiles), no errores de captura.
+    Devuelve una serie sin NaN.
     """
+    vacios = serie.isna().sum()
+    serie = serie.interpolate(method="time").bfill().ffill()
+    print(f"  Huecos interpolados: {vacios}")
+    atipicos = detectar_atipicos(serie)
+    print(f"  Atípicos (|z| > {UMBRAL:g} sobre el residuo STL robusto), "
+          f"se conservan: {len(atipicos)}")
+    if len(atipicos):
+        tabla = atipicos.copy()
+        tabla.index = tabla.index.strftime("%Y-%m")
+        print(tabla.round(3).to_string())
+    atipicos.to_csv(RESULTADOS / "atipicos.csv", index_label="fecha")
     return serie
 
 
+# ---------- Días hábiles de Islandia ----------
+# La exógena del miniproyecto 1 son los días hábiles del mes: de lunes a
+# viernes, menos los festivos oficiales de Islandia. En el miniproyecto 1 los
+# festivos salían de la librería `holidays`, que aquí no se permite, así que
+# se calculan con el calendario: dependen solo de la fecha, se conocen con
+# años de anticipación y no usan ningún dato de la serie.
+
+def pascua(anio):
+    """Domingo de Pascua (algoritmo gregoriano anónimo de Meeus, Jones y Butcher)."""
+    a = anio % 19
+    b, c = divmod(anio, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7  # noqa: E741
+    m = (a + 11 * h + 22 * l) // 451
+    mes, dia = divmod(h + l - 7 * m + 114, 31)
+    return pd.Timestamp(anio, mes, dia + 1)
+
+
+@lru_cache(maxsize=None)
+def festivos_islandia(anio):
+    """Los 14 festivos oficiales de Islandia en un año, los mismos que daba la
+    librería `holidays` en el miniproyecto 1. Nochebuena y Nochevieja son
+    medio día hábil y `holidays` no las cuenta, así que aquí tampoco."""
+    domingo = pascua(anio)
+    fijos = [pd.Timestamp(anio, mes, dia) for mes, dia in
+             [(1, 1),     # Año Nuevo
+              (5, 1),     # Día del Trabajo
+              (6, 17),    # Día Nacional
+              (12, 25),   # Navidad
+              (12, 26)]]  # San Esteban
+    # Jueves y Viernes Santo, Pascua, lunes de Pascua, Ascensión,
+    # Pentecostés y lunes de Pentecostés.
+    moviles = [domingo + pd.Timedelta(days=n) for n in (-3, -2, 0, 1, 39, 49, 50)]
+    abril_19, agosto_1 = pd.Timestamp(anio, 4, 19), pd.Timestamp(anio, 8, 1)
+    verano = abril_19 + pd.Timedelta(days=(3 - abril_19.dayofweek) % 7)   # 1.er jueves después del 18 de abril
+    comercio = agosto_1 + pd.Timedelta(days=(0 - agosto_1.dayofweek) % 7)  # 1.er lunes de agosto
+    return tuple(sorted(fijos + moviles + [verano, comercio]))
+
+
+def dias_habiles(fechas):
+    """Días hábiles de cada mes (lunes a viernes no festivos), centrados en 21
+    para que un coeficiente se lea como el efecto de un día hábil más."""
+    fechas = pd.DatetimeIndex(fechas)
+    festivos = np.array([f for anio in range(fechas.year.min(), fechas.year.max() + 1)
+                         for f in festivos_islandia(anio)], dtype="datetime64[D]")
+    inicio = fechas.to_numpy().astype("datetime64[D]")
+    fin = (fechas + pd.offsets.MonthBegin(1)).to_numpy().astype("datetime64[D]")
+    return pd.Series(np.busday_count(inicio, fin, holidays=festivos) - 21,
+                     index=fechas, name="dias_habiles", dtype=float)
+
+
+def exogenas(serie):
+    """Días hábiles de la serie y de los 12 meses siguientes, como en el
+    miniproyecto 1."""
+    fechas = pd.date_range(serie.index[0], periods=len(serie) + PERIODO, freq="MS")
+    return dias_habiles(fechas).to_frame()
+
+
+# ---------- El modelo a superar ----------
+ORDEN, ORDEN_ESTACIONAL = (2, 1, 0), (0, 1, 1, PERIODO)
+NOMBRE_CLASICO = "SARIMAX(2,1,0)(0,1,1)12 + días hábiles"
+# Sus métricas en el backtest del miniproyecto 1 (resultados/metricas.csv de
+# ese repositorio): la fila de referencia tiene que dar lo mismo.
+METRICAS_MP1 = {"RMSE": 0.64, "MAE": 0.54, "MAPE": 2.56}
+
+
 def modelo_clasico(serie):
-    """TODO: devuelva la función modelo(entrenamiento, h) del mejor modelo del
-    miniproyecto 1, con los mismos órdenes y la misma transformación.
+    """modelo(entrenamiento, h) del SARIMAX del miniproyecto 1.
 
-    Copie aquí lo que esa función necesite, como sus variables exógenas.
-    Dentro de modelo, guarde el ajuste en ULTIMO["modelo"] para que la tabla
-    cuente sus parámetros.
+    En cada origen se vuelve a estimar con los datos hasta el origen. Ajusta
+    con los días hábiles de esos meses y pronostica con los de los h meses
+    siguientes, que salen del calendario y no de la serie.
     """
-    raise NotImplementedError("el mejor modelo del miniproyecto 1")
+    x = exogenas(serie)
+
+    def modelo(entrenamiento, h):
+        ajuste = SARIMAX(entrenamiento, exog=x.loc[entrenamiento.index], order=ORDEN,
+                         seasonal_order=ORDEN_ESTACIONAL).fit(disp=False)
+        ULTIMO["modelo"] = ajuste
+        return ajuste.forecast(h, exog=x.loc[fechas_siguientes(entrenamiento, h)]).to_numpy()
+    return modelo
 
 
-# TODO: el nombre del modelo, con sus órdenes, como aparece en la tabla.
-NOMBRE_CLASICO = "SARIMA del miniproyecto 1"
+def comparar_con_mp1(fila_clasico):
+    """Imprime si la fila de referencia coincide con el miniproyecto 1."""
+    diferencias = {m: round(fila_clasico[m] - v, 2) for m, v in METRICAS_MP1.items()}
+    if all(d == 0 for d in diferencias.values()):
+        print("  Coincide con el miniproyecto 1: RMSE {RMSE}, MAE {MAE}, MAPE {MAPE}"
+              .format(**METRICAS_MP1))
+    else:
+        print(f"  Difiere del miniproyecto 1 {METRICAS_MP1}: diferencias {diferencias}")
 
 
 def graficar_serie(serie):
+    atipicos = detectar_atipicos(serie)
     figura, eje = plt.subplots(figsize=(9, 3.4))
-    eje.plot(serie.index, serie.to_numpy())
-    eje.axvline(serie.index[-N_PRUEBA], color="gray", linestyle="--")
-    eje.set_title(f"{VALOR}: serie mensual; a la derecha de la línea, los meses del backtest")
+    eje.axvspan(pd.Timestamp("2008-10-01"), pd.Timestamp("2009-12-01"),
+                color="#efefef", label="crisis bancaria 2008-2009")
+    eje.plot(serie.index, serie.to_numpy(), color=AZUL, label="uso de tarjetas débito")
+    eje.scatter(atipicos.index, atipicos["valor"], s=36, color=NARANJA, zorder=3,
+                edgecolor="white", linewidth=1, label=f"atípicos (|z| > {UMBRAL:g}), se conservan")
+    eje.axvline(serie.index[-N_PRUEBA], color=TINTA_SUAVE, linestyle="--", linewidth=1)
+    eje.text(serie.index[-N_PRUEBA], 1.01, " meses del backtest →", color=TINTA_SUAVE,
+             transform=eje.get_xaxis_transform(), va="bottom")
+    eje.set_title("Uso mensual de tarjetas débito en Islandia (millones de ISK)")
     eje.set_ylabel(VALOR)
+    eje.legend(loc="upper left")
     figura.tight_layout()
     figura.savefig(FIGURAS / "serie.png", dpi=120)
     plt.close(figura)
@@ -98,7 +235,13 @@ def graficar_serie(serie):
 # ============================================================
 # Lo que aprende cada modelo: "nivel" es la serie tal cual; "dif12" es la
 # diferencia con el mismo mes del año anterior.
-OBJETIVO = "nivel"     # TODO: elija "nivel" o "dif12" y justifíquelo
+# Se elige "dif12". La serie crece (la tendencia se multiplica por 2.7 entre
+# 2000 y 2013) y su máximo, diciembre de 2012, cae dentro de los meses del
+# backtest: un árbol que aprende el nivel no puede pronosticar por encima de lo
+# que vio al entrenar. La diferencia a 12 quita la estacionalidad (la misma
+# D = 1 del SARIMA) y deja una cantidad que sí se repite en el pasado.
+# justificar_objetivo imprime los datos que sostienen la decisión.
+OBJETIVO = "dif12"
 REZAGOS = 12
 
 
@@ -112,22 +255,90 @@ def a_nivel(y, z):
 
 
 def tabla_supervisada(z):
-    """TODO: una fila por mes con los rezagos 1 a REZAGOS, al menos el mes del
-    año y al menos una estadística de ventana móvil.
+    """Una fila por mes t con lo que se sabe antes de que t ocurra.
 
-    Ninguna columna de la fila t puede usar z(t): los rezagos con shift(k) y
-    las ventanas sobre la serie ya corrida un mes.
+    - rezago_1 ... rezago_12: z(t-1) ... z(t-12), con shift(k).
+    - mes, mes_sin, mes_cos: el mes del año, como número y en el círculo
+      (para que diciembre y enero queden cerca en KNN, SVR y las redes).
+    - media_3, media_12, desv_12: ventanas móviles sobre z corrida un mes,
+      es decir, sobre z(t-1) hacia atrás.
+    - dias_habiles, dif_dias_habiles: los días hábiles de t y su diferencia
+      con los de t-12. Salen del calendario, no de la serie: se conocen de
+      antemano, como la exógena del SARIMAX.
+    Ninguna columna de la fila t usa z(t).
     """
-    raise NotImplementedError("tabla supervisada")
+    pasado = z.shift(1)
+    columnas = {f"rezago_{k}": z.shift(k) for k in range(1, REZAGOS + 1)}
+    mes = z.index.month.to_numpy()
+    columnas["mes"] = mes
+    columnas["mes_sin"] = np.sin(2 * np.pi * mes / 12)
+    columnas["mes_cos"] = np.cos(2 * np.pi * mes / 12)
+    columnas["media_3"] = pasado.rolling(3).mean()
+    columnas["media_12"] = pasado.rolling(12).mean()
+    columnas["desv_12"] = pasado.rolling(12).std()
+    habiles = dias_habiles(z.index).to_numpy()
+    columnas["dias_habiles"] = habiles
+    columnas["dif_dias_habiles"] = habiles - dias_habiles(z.index - pd.DateOffset(years=1)).to_numpy()
+    return pd.DataFrame(columnas, index=z.index)
 
 
-def comprobar_sin_fuga(serie):
-    """TODO: pruebe en el código que ninguna fila ve el mes que predice.
+def filas_iguales(a, b):
+    return np.array_equal(a.to_numpy(dtype=float), b.to_numpy(dtype=float), equal_nan=True)
 
-    Por ejemplo, cambie el valor de cada mes y verifique que su fila de la
-    tabla no cambie. Si una fila cambia, lance AssertionError.
+
+def comprobar_sin_fuga(serie, tabla=tabla_supervisada):
+    """Prueba en el código que ninguna fila ve el mes que predice.
+
+    Para cada mes t se suma 1000 a y(t), se rearma la tabla y se exige que la
+    fila t quede idéntica. Lanza AssertionError si alguna fila cambia. Para
+    mostrar que la prueba sí detecta algo, cuenta además en cuántos meses la
+    fila t+1 cambia (su rezago_1 lee el mes alterado). Devuelve ese conteo.
     """
-    raise NotImplementedError("prueba de que no hay fuga")
+    base = tabla(objetivo(serie))
+    cambia_siguiente = 0
+    for t in range(len(serie)):
+        alterada = serie.copy()
+        alterada.iloc[t] += 1000.0
+        nueva = tabla(objetivo(alterada))
+        if not filas_iguales(nueva.iloc[t], base.iloc[t]):
+            raise AssertionError(f"la fila de {serie.index[t]:%Y-%m} cambia al alterar "
+                                 "su propio mes: la tabla ve el mes que predice")
+        if t + 1 < len(serie) and not filas_iguales(nueva.iloc[t + 1], base.iloc[t + 1]):
+            cambia_siguiente += 1
+    return cambia_siguiente
+
+
+def tabla_con_fuga(z):
+    """Control negativo: la misma tabla con una ventana que olvida shift(1)."""
+    return tabla_supervisada(z).assign(media_3=z.rolling(3).mean())
+
+
+def probar_tabla(serie):
+    """Corre la prueba de fuga sobre la tabla real y sobre el control negativo."""
+    cambia_siguiente = comprobar_sin_fuga(serie)
+    print(f"  Prueba de fuga: se alteró cada uno de los {len(serie)} meses y ninguna "
+          "fila cambió al alterar su propio mes.")
+    print(f"  La fila siguiente sí cambió en {cambia_siguiente} de {len(serie) - 1} casos "
+          f"(en los primeros {PERIODO} meses z(t) no existe: la diferencia a 12 necesita "
+          "el año anterior).")
+    try:
+        comprobar_sin_fuga(serie, tabla_con_fuga)
+    except AssertionError as error:
+        print(f"  Control negativo: con media_3 sin shift(1) la prueba falla, como debe: {error}")
+    else:
+        raise RuntimeError("la prueba de fuga no detectó una ventana sin shift(1)")
+
+
+def describir_tabla(serie):
+    X, z = filas_completas(serie.iloc[:-N_PRUEBA])
+    X_ultimo, _ = filas_completas(serie.iloc[:-PERIODO])
+    print(f"  {X.shape[1]} columnas: {', '.join(X.columns)}")
+    print(f"  Filas completas para entrenar: {len(X)} en el primer origen del backtest "
+          f"({X.index[0]:%Y-%m} a {X.index[-1]:%Y-%m}) y {len(X_ultimo)} en el último. "
+          f"Se pierden los primeros {len(serie.iloc[:-N_PRUEBA]) - len(X)} meses: "
+          f"{PERIODO} por la diferencia a 12 y {REZAGOS} por los rezagos.")
+    print(f"  Objetivo z = dif12: media {z.mean():.3f}, desviación {z.std():.3f}, "
+          f"de {z.min():.3f} a {z.max():.3f}")
 
 
 def filas_completas(y):
@@ -138,14 +349,52 @@ def filas_completas(y):
 
 
 def recursivo(ajustado, y, h):
-    """TODO: pronóstico recursivo a h meses.
+    """Pronóstico recursivo a h meses.
 
-    Agregue el mes siguiente a y como NaN, arme la última fila de la tabla,
-    pronostique con ajustado.predict, devuelva el pronóstico al nivel con
-    a_nivel y escríbalo como si fuera dato antes de pasar al mes siguiente.
-    Devuelva los h pronósticos.
+    Para cada mes siguiente: se agrega a y como NaN, se arma su fila (que solo
+    mira meses anteriores), se pronostica z, se lleva al nivel con
+    y(t) = y(t-12) + z(t) y ese pronóstico se escribe como si fuera dato, para
+    que entre como rezago del mes que sigue.
     """
-    raise NotImplementedError("pronóstico recursivo")
+    y = y.copy()
+    for fecha in fechas_siguientes(y, h):
+        extendida = pd.concat([y, pd.Series([np.nan], index=[fecha])])
+        fila = tabla_supervisada(objetivo(extendida)).iloc[[-1]]
+        z_hat = float(np.ravel(ajustado.predict(fila))[0])
+        y.loc[fecha] = a_nivel(y, z_hat)   # y aún no tiene la fecha: y.iloc[-12] es y(t-12)
+    return y.iloc[-h:].to_numpy()
+
+
+def justificar_objetivo(serie):
+    """Los datos que sostienen OBJETIVO = "dif12", sin tocar el backtest.
+
+    1. Cuántos meses del backtest superan el máximo visto antes de él.
+    2. Un experimento con los meses anteriores al backtest: se entrena hasta
+       12 meses antes del primer origen y se pronostican, en modo recursivo,
+       esos 12 meses con Random Forest y XGBoost, aprendiendo el nivel y la
+       diferencia a 12.
+    """
+    global OBJETIVO
+    antes, prueba = serie.iloc[:-N_PRUEBA], serie.iloc[-N_PRUEBA:]
+    print(f"  Máximo antes del backtest: {antes.max():.3f} ({antes.idxmax():%Y-%m}); "
+          f"en los meses del backtest: {prueba.max():.3f} ({prueba.idxmax():%Y-%m}). "
+          f"{int((prueba > antes.max()).sum())} de los {N_PRUEBA} meses del backtest "
+          "superan todo lo visto antes.")
+    entrenamiento, validacion = antes.iloc[:-PERIODO], antes.iloc[-PERIODO:]
+    elegido, filas_exp = OBJETIVO, []
+    try:
+        for opcion in ("nivel", "dif12"):
+            OBJETIVO = opcion
+            for nombre, fabrica in (("Random Forest", bosque), ("XGBoost", xgboost)):
+                pronostico = con_tabla(fabrica)(entrenamiento, PERIODO)
+                filas_exp.append({"objetivo": opcion, "modelo": nombre,
+                                  "RMSE": round(rmse(validacion, pronostico), 3)})
+    finally:
+        OBJETIVO = elegido
+    experimento = pd.DataFrame(filas_exp).pivot(index="modelo", columns="objetivo", values="RMSE")
+    print(f"  Experimento: entrenar hasta {entrenamiento.index[-1]:%Y-%m} y pronosticar "
+          f"{validacion.index[0]:%Y-%m} a {validacion.index[-1]:%Y-%m} (RMSE a 12 meses):")
+    print(experimento.to_string())
 
 
 def con_tabla(fabrica):
@@ -402,26 +651,38 @@ def pendiente(parte, error):
 
 def main():
     inicio = time.perf_counter()
+    print("1. La serie y el modelo a superar")
     cruda = cargar_serie(ARCHIVO, FECHA, VALOR)
-    print(f"Serie: {len(cruda)} meses, de {cruda.index[0]:%Y-%m} a "
-          f"{cruda.index[-1]:%Y-%m}, {cruda.isna().sum()} vacíos")
+    print(f"  Serie: {len(cruda)} meses, de {cruda.index[0]:%Y-%m} a "
+          f"{cruda.index[-1]:%Y-%m}, {cruda.isna().sum()} vacíos; mínimo "
+          f"{cruda.min():.3f} ({cruda.idxmin():%Y-%m}), máximo {cruda.max():.3f} "
+          f"({cruda.idxmax():%Y-%m})")
     serie = preparar(cruda)
     graficar_serie(serie)
+    habiles = dias_habiles(serie.index) + 21
+    print(f"  Días hábiles por mes (calendario de Islandia): de {habiles.min():.0f} "
+          f"a {habiles.max():.0f}")
+    primero = len(serie) - N_PRUEBA
+    print(f"  Backtest: {N_PRUEBA - PERIODO + 1} orígenes, de "
+          f"{serie.index[primero - 1]:%Y-%m} a {serie.index[-PERIODO - 1]:%Y-%m}; "
+          f"meses pronosticados: {serie.index[primero]:%Y-%m} a {serie.index[-1]:%Y-%m}")
 
-    print("1. Línea base y modelo a superar")
     filas = [fila("estacional ingenuo", serie,
                   lambda t, h: estacional_ingenuo(t, h, PERIODO))]
     elegidos_para_figura = {}
     try:
         clasico = modelo_clasico(serie)
         filas.append(fila(NOMBRE_CLASICO, serie, clasico))
+        comparar_con_mp1(filas[-1])
         elegidos_para_figura[NOMBRE_CLASICO] = clasico
     except NotImplementedError as error:
         pendiente("parte 1", error)
 
     print("2. Tabla supervisada")
     try:
-        comprobar_sin_fuga(serie)
+        describir_tabla(serie)
+        probar_tabla(serie)
+        justificar_objetivo(serie)
         tabla_lista = True
     except NotImplementedError as error:
         pendiente("parte 2", error)
