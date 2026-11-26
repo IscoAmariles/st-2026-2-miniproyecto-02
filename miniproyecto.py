@@ -434,13 +434,18 @@ def xgboost(max_depth=3, learning_rate=0.1):
                         random_state=SEMILLA)
 
 
-# TODO: complete cada rejilla con dos a cuatro valores por hiperparámetro.
+# Dos a cuatro valores por hiperparámetro. KNN: cuántos meses parecidos se
+# promedian. SVR: C (cuánto castiga los errores) y epsilon (el margen que no
+# castiga, en unidades de z). Bosque y XGBoost: la profundidad de los árboles,
+# que limita cuántas interacciones aprenden con ~116 filas; el mínimo de filas
+# por hoja y la tasa de aprendizaje.
 REJILLAS = {
-    "KNN": (knn, {"n_neighbors": [5]}),
-    "SVR": (svr, {"C": [1.0], "epsilon": [0.1]}),
-    "Random Forest": (bosque, {"max_depth": [None], "min_samples_leaf": [1]}),
-    "XGBoost": (xgboost, {"max_depth": [3], "learning_rate": [0.1]}),
+    "KNN": (knn, {"n_neighbors": [3, 5, 7, 10]}),
+    "SVR": (svr, {"C": [0.1, 1.0, 10.0], "epsilon": [0.01, 0.1, 0.3]}),
+    "Random Forest": (bosque, {"max_depth": [3, 5, None], "min_samples_leaf": [1, 3, 5]}),
+    "XGBoost": (xgboost, {"max_depth": [2, 3, 5], "learning_rate": [0.03, 0.1, 0.3]}),
 }
+N_PLIEGUES = 5
 
 
 def sin_prefijo(parametros):
@@ -448,24 +453,72 @@ def sin_prefijo(parametros):
 
 
 def ajustar_hiperparametros(serie):
-    """TODO: para cada modelo de REJILLAS, la combinación con menor RMSE en
-    validación temporal.
+    """La combinación de menor RMSE en validación temporal para cada modelo.
 
-    Arme la tabla con serie.iloc[:-N_PRUEBA], para que ninguno de los meses
-    del backtest decida, y busque con GridSearchCV y TimeSeriesSplit. KNN y
-    SVR son make_pipeline: sus claves en la rejilla llevan el prefijo del paso
-    (kneighborsregressor__n_neighbors). Imprima lo elegido y su RMSE de
-    validación. Devuelva {nombre: {hiperparámetro: valor}}; sin_prefijo
-    quita el prefijo.
+    La tabla se arma con serie.iloc[:-N_PRUEBA]: ninguno de los 24 meses del
+    backtest participa. TimeSeriesSplit parte esas filas en pliegues que
+    siempre validan con meses posteriores a los de entrenamiento. Guarda
+    resultados/rejillas.csv con todas las combinaciones.
     """
-    raise NotImplementedError("hiperparámetros con validación temporal")
+    X, z = filas_completas(serie.iloc[:-N_PRUEBA])
+    validacion = TimeSeriesSplit(n_splits=N_PLIEGUES)
+    pliegues = list(validacion.split(X))
+    print(f"  TimeSeriesSplit({N_PLIEGUES}) sobre las {len(X)} filas anteriores al backtest "
+          f"({X.index[0]:%Y-%m} a {X.index[-1]:%Y-%m}): entrenamiento de "
+          f"{len(pliegues[0][0])} a {len(pliegues[-1][0])} filas, validación de "
+          f"{len(pliegues[0][1])} filas en cada pliegue; el último valida "
+          f"{X.index[pliegues[-1][1][0]]:%Y-%m} a {X.index[pliegues[-1][1][-1]]:%Y-%m}.")
+    print("  RMSE de validación a un paso, en unidades de z (millones de ISK):")
+    elegidos, filas_rejilla = {}, []
+    for nombre, (fabrica, rejilla) in REJILLAS.items():
+        modelo = fabrica()
+        prefijo = modelo.steps[-1][0] + "__" if hasattr(modelo, "steps") else ""
+        busqueda = GridSearchCV(modelo, {prefijo + clave: valores for clave, valores in rejilla.items()},
+                                cv=validacion, scoring="neg_root_mean_squared_error", n_jobs=1)
+        busqueda.fit(X, z)
+        elegidos[nombre] = sin_prefijo(busqueda.best_params_)
+        resultados = busqueda.cv_results_
+        for parametros, media, desv, puesto in zip(resultados["params"], resultados["mean_test_score"],
+                                                   resultados["std_test_score"],
+                                                   resultados["rank_test_score"]):
+            filas_rejilla.append({"modelo": nombre, "hiperparametros": str(sin_prefijo(parametros)),
+                                  "RMSE_validacion": round(-media, 4), "desviacion": round(desv, 4),
+                                  "elegido": puesto == 1})
+        print(f"    {nombre}: {elegidos[nombre]}, RMSE {-busqueda.best_score_:.3f} "
+              f"(de {len(resultados['params'])} combinaciones)")
+    pd.DataFrame(filas_rejilla).to_csv(RESULTADOS / "rejillas.csv", index=False)
+    return elegidos
 
 
 def graficar_importancia(serie, elegidos):
-    """TODO: importancia de las variables de Random Forest y XGBoost
-    (feature_importances_), ajustados con lo elegido; guarde
-    figuras/importancia.png."""
-    raise NotImplementedError("importancia de variables")
+    """Importancia de las variables de Random Forest y XGBoost, ajustados con
+    lo elegido sobre las filas anteriores al backtest. Guarda
+    figuras/importancia.png y resultados/importancia.csv."""
+    X, z = filas_completas(serie.iloc[:-N_PRUEBA])
+    importancias = pd.DataFrame({
+        "Random Forest": bosque(**elegidos["Random Forest"]).fit(X, z).feature_importances_,
+        "XGBoost": xgboost(**elegidos["XGBoost"]).fit(X, z).feature_importances_,
+    }, index=X.columns)
+    importancias = importancias.loc[importancias.mean(axis=1).sort_values().index]
+    importancias[::-1].round(4).to_csv(RESULTADOS / "importancia.csv", index_label="variable")
+    for nombre in importancias.columns:
+        primeras = importancias[nombre].sort_values(ascending=False).head(5)
+        print(f"  Importancia, {nombre}: "
+              + ", ".join(f"{v} {p:.3f}" for v, p in primeras.items()))
+
+    figura, ejes = plt.subplots(1, 2, figsize=(9, 5.2), sharey=True)
+    medidas = {"Random Forest": "reducción de impureza (suma 1)",
+               "XGBoost": "ganancia promedio por división (suma 1)"}
+    for eje, nombre in zip(ejes, importancias.columns):
+        eje.barh(importancias.index, importancias[nombre], height=0.6, color=AZUL)
+        eje.set_title(nombre)
+        eje.set_xlabel(medidas[nombre])
+        eje.grid(axis="y", visible=False)
+    figura.suptitle("Qué variables usan los ensambles (ordenadas por la importancia promedio)",
+                    x=0.01, ha="left", fontweight="bold", fontsize=11)
+    figura.tight_layout()
+    figura.savefig(FIGURAS / "importancia.png", dpi=120)
+    plt.close(figura)
 
 
 # ============================================================
