@@ -669,11 +669,27 @@ def contar_parametros(ajustado):
     return 0
 
 
+# Lo que cada modelo hizo en el backtest: el RMSE de cada origen y los 12
+# pronósticos de cada origen, para ver qué mes pronostica peor cada uno.
+POR_ORIGEN = {}
+PRONOSTICOS = {}
+
+
 def fila(nombre, serie, modelo):
     ULTIMO.clear()
+    guardados = []
+
+    def registrado(entrenamiento, h):
+        # El mismo modelo; solo guarda lo que pronostica, con sus fechas.
+        pronostico = np.asarray(modelo(entrenamiento, h))
+        guardados.append(pd.Series(pronostico, index=fechas_siguientes(entrenamiento, h)))
+        return pronostico
+
     inicio = time.perf_counter()
-    _, promedio = backtest(serie, modelo)
+    por_origen, promedio = backtest(serie, registrado)
     segundos = time.perf_counter() - inicio
+    POR_ORIGEN[nombre] = por_origen.set_index("origen")["RMSE"]
+    PRONOSTICOS[nombre] = guardados
     parametros = contar_parametros(ULTIMO["modelo"]) if "modelo" in ULTIMO else 0
     print(f"  {nombre}: RMSE {promedio['RMSE']:.2f} en {segundos:.1f} s")
     return {"modelo": nombre, "RMSE": round(promedio["RMSE"], 2),
@@ -681,18 +697,90 @@ def fila(nombre, serie, modelo):
             "parametros": parametros, "segundos": round(segundos, 1)}
 
 
+def errores_por_mes(serie, firmado=False):
+    """Error de cada modelo en cada mes pronosticado, promediado sobre los
+    orígenes que lo pronostican (de 1 a 12 según el mes). Con firmado=True es
+    pronóstico menos real: negativo = el modelo se quedó corto."""
+    columnas = {}
+    for nombre, pronosticos in PRONOSTICOS.items():
+        errores = pd.concat([p - serie.loc[p.index] for p in pronosticos])
+        columnas[nombre] = (errores if firmado else errores.abs()).groupby(level=0).mean()
+    return pd.DataFrame(columnas)
+
+
+def analizar_errores(serie, tabla):
+    """Guarda el RMSE por origen y el error por mes pronosticado, e imprime
+    dónde falla más cada modelo."""
+    orden = list(tabla["modelo"])
+    por_origen = pd.DataFrame(POR_ORIGEN)[orden]
+    por_origen.index = por_origen.index.strftime("%Y-%m")
+    por_origen.round(3).to_csv(RESULTADOS / "rmse_por_origen.csv", index_label="origen")
+    absoluto = errores_por_mes(serie)[orden]
+    firmado = errores_por_mes(serie, firmado=True)[orden]
+    salida = absoluto.copy()
+    salida.index = salida.index.strftime("%Y-%m")
+    salida.round(3).to_csv(RESULTADOS / "error_por_mes.csv", index_label="mes")
+    print("  Dónde falla más cada modelo (error absoluto medio por mes pronosticado; "
+          "peor origen por RMSE):")
+    for nombre in orden:
+        mes = absoluto[nombre].idxmax()
+        sentido = "se queda corto" if firmado.loc[mes, nombre] < 0 else "se pasa"
+        print(f"    {nombre}: peor mes {mes:%Y-%m} (error {absoluto.loc[mes, nombre]:.2f}, "
+              f"{sentido}; real {serie[mes]:.3f}); peor origen {por_origen[nombre].idxmax()} "
+              f"(RMSE {por_origen[nombre].max():.2f})")
+    return absoluto
+
+
+def datos_frente_a_parametros(serie, tabla):
+    """Cuántos números ajusta cada modelo frente a los datos con que se ajusta,
+    en el último origen del backtest."""
+    meses = len(serie) - PERIODO
+    filas_tabla = len(filas_completas(serie.iloc[:-PERIODO])[0])
+    print(f"  Datos en el último origen: {meses} meses para el SARIMAX; {filas_tabla} filas "
+          "completas para los modelos de la tabla (cada fila, 20 números).")
+    for _, f in tabla.iterrows():
+        if f["parametros"] == 0:
+            continue
+        base = meses if f["modelo"] == NOMBRE_CLASICO else filas_tabla
+        print(f"    {f['modelo']}: {f['parametros']} parámetros, "
+              f"{f['parametros'] / base:.2f} por {'mes' if base == meses else 'fila'}")
+
+
+def graficar_error_por_mes(serie, tabla, absoluto):
+    """El error por mes pronosticado del SARIMAX, el mejor modelo de
+    aprendizaje automático y la mejor red."""
+    destacados = [NOMBRE_CLASICO]
+    destacados += [n for n in tabla["modelo"] if n in REJILLAS][:1]
+    destacados += [n for n in tabla["modelo"] if "épocas" in n][:1]
+    destacados = [n for n in destacados if n in absoluto.columns]
+    figura, eje = plt.subplots(figsize=(9, 3.6))
+    for nombre in destacados:
+        eje.plot(absoluto.index, absoluto[nombre], marker="o", markersize=4, label=nombre)
+    pico = serie.iloc[-N_PRUEBA:].idxmax()
+    eje.axvline(pico, color=TINTA_SUAVE, linestyle=":", linewidth=1)
+    eje.text(pico, 1.01, f" {pico:%Y-%m}: máximo de la serie", color=TINTA_SUAVE,
+             transform=eje.get_xaxis_transform(), va="bottom")
+    eje.set_ylabel("error absoluto medio")
+    eje.set_title("Error por mes pronosticado (promedio sobre los orígenes que lo pronostican)",
+                  pad=16)
+    eje.legend(loc="upper left")
+    figura.tight_layout()
+    figura.savefig(FIGURAS / "error_por_mes.png", dpi=120)
+    plt.close(figura)
+
+
 def graficar_pronosticos(serie, modelos):
     """Pronóstico desde el último origen del backtest de cada modelo elegido."""
     entrenamiento, real = serie.iloc[:-12], serie.iloc[-12:]
-    figura, eje = plt.subplots(figsize=(9, 3.6))
-    eje.plot(serie.index[-36:], serie.iloc[-36:].to_numpy(), color="black", label="real")
+    figura, eje = plt.subplots(figsize=(9, 4.2))
+    eje.plot(serie.index[-36:], serie.iloc[-36:].to_numpy(), color=TINTA, label="real")
     for nombre, modelo in modelos.items():
         pronostico = modelo(entrenamiento, 12)
-        eje.plot(real.index, pronostico, marker="o", markersize=3,
-                 label=f"{nombre} (RMSE {rmse(real, pronostico):.1f})")
+        eje.plot(real.index, pronostico, marker="o", markersize=4, linestyle="--",
+                 label=f"{nombre} (RMSE {rmse(real, pronostico):.2f})")
     eje.set_ylabel(VALOR)
-    eje.set_title("Pronóstico a 12 meses desde el último origen")
-    eje.legend(fontsize=8)
+    eje.set_title(f"Pronóstico a 12 meses desde el último origen ({entrenamiento.index[-1]:%Y-%m})")
+    eje.legend(loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=2)
     figura.tight_layout()
     figura.savefig(FIGURAS / "pronosticos.png", dpi=120)
     plt.close(figura)
@@ -772,6 +860,9 @@ def main():
     tabla.to_csv(RESULTADOS / "metricas.csv", index=False)
     print(tabla.to_string(index=False))
     print("Mejor modelo por RMSE:", tabla.iloc[0]["modelo"])
+    absoluto = analizar_errores(serie, tabla)
+    graficar_error_por_mes(serie, tabla, absoluto)
+    datos_frente_a_parametros(serie, tabla)
     if len(elegidos_para_figura) > 1:
         graficar_pronosticos(serie, elegidos_para_figura)
     print(f"Tiempo total: {time.perf_counter() - inicio:.0f} s")
