@@ -1,0 +1,6 @@
+red,epocas,semilla,RMSE,MAE,MAPE,segundos
+Conv1D (8 filtros),19,2026,0.7761,0.6231,2.9188,0.9
+Conv1D (8 filtros),19,2027,0.731,0.5674,2.663,1.0
+Conv1D (8 filtros),19,2028,0.8134,0.637,2.9544,0.9
+Conv1D (8 filtros),19,2029,0.7136,0.5566,2.6164,0.8
+Conv1D (8 filtros),19,2030,0.8441,0.6511,3.0119,0.9
