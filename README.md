@@ -31,9 +31,12 @@ del grupo. Si falta algún dato, se advierte en la realimentación.
 
 | Nombre completo | Código | Correo institucional |
 |---|---|---|
-| | | |
-| | | |
-| | | |
+| Francisco Amariles Jurado | 22505523 | francisco.amariles@uao.edu.co |
+| Jean Pierre Henriquez | 22505892 | jean.henriquez@uao.edu.co |
+
+**Serie del grupo:** uso mensual de tarjetas débito en Islandia, 2000-01 a
+2013-08 (164 meses). Ficha en [`datos/README.md`](datos/README.md) e informe en
+[`docs/informe.md`](docs/informe.md).
 
 ## Entrega
 
