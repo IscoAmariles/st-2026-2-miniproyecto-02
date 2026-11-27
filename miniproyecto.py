@@ -594,40 +594,115 @@ class MLP(nn.Module):
 
 
 class LSTM(nn.Module):
-    """TODO: nn.LSTM de una capa sobre la secuencia (lote, 12, 1) y una capa
-    lineal que lee el último estado oculto."""
+    """Una capa nn.LSTM sobre la secuencia (lote, 12, 1), del rezago más viejo
+    al más reciente, y una capa lineal que lee el último estado oculto."""
 
-    def __init__(self, ocultas=16):
+    def __init__(self, entradas=1, ocultas=16):
         super().__init__()
-        raise NotImplementedError("LSTM")
+        self.lstm = nn.LSTM(entradas, ocultas, batch_first=True)
+        self.salida = nn.Linear(ocultas, 1)
+
+    def forward(self, x):
+        salida, _ = self.lstm(x)
+        return self.salida(salida[:, -1, :])
 
 
-# TODO: la tercera red, a elección: Conv1D, un híbrido (el clásico más una
-# red sobre sus residuos) o un Transformer pequeño. Una Conv1D o un
-# Transformer reciben la secuencia como la LSTM y entran en CANDIDATAS. Un
-# híbrido no pasa por con_tabla: escriba su propia función
-# modelo(entrenamiento, h) y agregue su fila en main.
+# La tercera red es una Conv1D. Recibe la misma secuencia que la LSTM, pero con
+# 8 filtros de 3 meses tiene unos 110 parámetros, diez veces menos que la
+# LSTM, para entrenar con ~116 filas; y un filtro de 3 meses mira la misma
+# dinámica de corto plazo que el AR(2) del SARIMAX.
+class Conv1D(nn.Module):
+    """nn.Conv1d con `filtros` filtros de tamaño `kernel` sobre los 12 rezagos,
+    ReLU, y una capa lineal sobre todas las salidas de los filtros."""
+
+    def __init__(self, entradas=1, filtros=8, kernel=3):
+        super().__init__()
+        self.capas = nn.Sequential(nn.Conv1d(entradas, filtros, kernel), nn.ReLU(),
+                                   nn.Flatten(), nn.Linear(filtros * (REZAGOS - kernel + 1), 1))
+
+    def forward(self, x):
+        # Red entrega (lote, 12, 1); Conv1d espera (lote, canales, pasos).
+        return self.capas(x.transpose(1, 2))
 
 
 # Las candidatas: nombre, cómo se construye y si recibe la secuencia.
-# TODO: agregue la LSTM, con secuencia=True, y la tercera red.
 CANDIDATAS = {
     "MLP (8 ocultas)": (lambda n: MLP(n, 8), False),
     "MLP (32 ocultas)": (lambda n: MLP(n, 32), False),
+    "LSTM (16 ocultas)": (lambda n: LSTM(n, 16), True),
+    "Conv1D (8 filtros)": (lambda n: Conv1D(n, 8, 3), True),
 }
 
 
 def validar_redes(serie):
-    """TODO: elija las épocas de cada red con validación temporal.
+    """Las épocas de cada red, elegidas con validación temporal.
 
-    Arme la tabla con serie.iloc[:-N_PRUEBA] y deje sus últimos 12 meses de
-    validación. Entrene cada candidata con Red(...).fit(X_ent, z_ent, X_val,
-    z_val): red.perdidas guarda por época la pérdida de entrenamiento y la de
-    validación. Grafique las curvas en figuras/perdida.png, quédese con el
-    MLP de menor pérdida de validación y devuelva {nombre: épocas}, con las
-    épocas de menor pérdida de validación de cada red.
+    La tabla se arma con serie.iloc[:-N_PRUEBA], así que ninguno de los 24
+    meses del backtest participa, y sus últimos 12 meses son la validación.
+    Cada candidata se entrena EPOCAS_MAXIMAS épocas y sus épocas son las de
+    menor pérdida de validación. De los dos MLP queda el de menor pérdida de
+    validación. Guarda figuras/perdida.png y resultados/validacion_redes.csv,
+    y devuelve {nombre: épocas} del mejor MLP, la LSTM y la Conv1D.
     """
-    raise NotImplementedError("validación de las redes")
+    X, z = filas_completas(serie.iloc[:-N_PRUEBA])
+    X_ent, z_ent = X.iloc[:-PERIODO], z.iloc[:-PERIODO]
+    X_val, z_val = X.iloc[-PERIODO:], z.iloc[-PERIODO:]
+    print(f"  Validación: entrenamiento con {len(X_ent)} filas ({X_ent.index[0]:%Y-%m} a "
+          f"{X_ent.index[-1]:%Y-%m}), validación con {len(X_val)} ({X_val.index[0]:%Y-%m} a "
+          f"{X_val.index[-1]:%Y-%m}); hasta {EPOCAS_MAXIMAS} épocas, pérdida MSE en "
+          "unidades estandarizadas de z.")
+    curvas, filas_val = {}, []
+    for nombre, (construir, secuencia) in CANDIDATAS.items():
+        ajustada = Red(construir, secuencia).fit(X_ent, z_ent, X_val, z_val)
+        perdidas = np.array(ajustada.perdidas)
+        epocas = int(np.argmin(perdidas[:, 1])) + 1
+        curvas[nombre] = (perdidas, epocas)
+        filas_val.append({"red": nombre,
+                          "parametros": sum(p.numel() for p in ajustada.red.parameters()),
+                          "epocas": epocas,
+                          "perdida_entrenamiento": round(perdidas[epocas - 1, 0], 4),
+                          "perdida_validacion": round(perdidas[epocas - 1, 1], 4),
+                          "perdida_validacion_final": round(perdidas[-1, 1], 4)})
+    tabla = pd.DataFrame(filas_val)
+    tabla.to_csv(RESULTADOS / "validacion_redes.csv", index=False)
+    for f in filas_val:
+        print(f"    {f['red']}: {f['parametros']} parámetros, {f['epocas']} épocas; pérdida de "
+              f"validación {f['perdida_validacion']:.3f} (en la época {EPOCAS_MAXIMAS}: "
+              f"{f['perdida_validacion_final']:.3f})")
+
+    mlps = tabla[tabla["red"].str.startswith("MLP")]
+    mejor_mlp = mlps.loc[mlps["perdida_validacion"].idxmin(), "red"]
+    print(f"  MLP elegido: {mejor_mlp}")
+    graficar_perdidas(curvas)
+    return {nombre: curvas[nombre][1] for nombre in CANDIDATAS
+            if not nombre.startswith("MLP") or nombre == mejor_mlp}
+
+
+def graficar_perdidas(curvas):
+    """Un panel por candidata con las pérdidas de entrenamiento y validación por
+    época, y una línea vertical en la época elegida."""
+    # Cada panel con su propia escala: el MLP grande baja la pérdida de
+    # entrenamiento varios órdenes más que los demás y aplastaría sus curvas.
+    figura, ejes = plt.subplots(2, 2, figsize=(9, 5.6), sharex=True)
+    for eje, (nombre, (perdidas, epocas)) in zip(ejes.ravel(), curvas.items()):
+        x = np.arange(1, len(perdidas) + 1)
+        eje.plot(x, perdidas[:, 0], color=AZUL, label="entrenamiento")
+        eje.plot(x, perdidas[:, 1], color=NARANJA, label="validación")
+        eje.axvline(epocas, color=TINTA_SUAVE, linestyle="--", linewidth=1)
+        eje.text(epocas, 0.98, f" {epocas} épocas", color=TINTA_SUAVE, va="top",
+                 transform=eje.get_xaxis_transform())
+        eje.set_yscale("log")
+        eje.set_title(nombre)
+    for eje in ejes[-1]:
+        eje.set_xlabel("época")
+    for eje in ejes[:, 0]:
+        eje.set_ylabel("MSE (z estandarizada)")
+    ejes[0, 0].legend(loc="lower left")
+    figura.suptitle("Curvas de pérdida: la línea marca la época de menor pérdida de validación",
+                    x=0.01, ha="left", fontweight="bold", fontsize=11)
+    figura.tight_layout()
+    figura.savefig(FIGURAS / "perdida.png", dpi=120)
+    plt.close(figura)
 
 
 def red(nombre, epocas, semilla=SEMILLA):
@@ -636,13 +711,30 @@ def red(nombre, epocas, semilla=SEMILLA):
     return lambda: Red(construir, secuencia, epocas, semilla)
 
 
-def repetir_con_semillas(serie, nombre, epocas):
-    """TODO: la mejor red con cinco semillas, cada una por el backtest.
+SEMILLAS = range(2026, 2031)
 
-    Use con_tabla(red(nombre, epocas, semilla)). Guarde resultados/semillas.csv
-    con una fila por semilla e imprima la media y la desviación del RMSE.
+
+def repetir_con_semillas(serie, nombre, epocas):
+    """La mejor red con cinco semillas, cada una por el backtest completo.
+
+    Guarda resultados/semillas.csv con una fila por semilla, imprime el RMSE
+    de cada una y devuelve la media y la desviación (ddof=1) del RMSE.
     """
-    raise NotImplementedError("cinco semillas")
+    filas_semillas = []
+    for semilla in SEMILLAS:
+        inicio = time.perf_counter()
+        _, promedio = backtest(serie, con_tabla(red(nombre, epocas, semilla)))
+        filas_semillas.append({"red": nombre, "epocas": epocas, "semilla": semilla,
+                               "RMSE": round(promedio["RMSE"], 4), "MAE": round(promedio["MAE"], 4),
+                               "MAPE": round(promedio["MAPE"], 4),
+                               "segundos": round(time.perf_counter() - inicio, 1)})
+    tabla = pd.DataFrame(filas_semillas)
+    tabla.to_csv(RESULTADOS / "semillas.csv", index=False)
+    media, desv = tabla["RMSE"].mean(), tabla["RMSE"].std(ddof=1)
+    print(f"  {nombre}, {epocas} épocas, con {len(tabla)} semillas: RMSE "
+          + ", ".join(f"{f['RMSE']:.3f} ({f['semilla']})" for f in filas_semillas))
+    print(f"  Media {media:.3f}, desviación {desv:.3f} (ddof=1)")
+    return media, desv
 
 
 # ============================================================
@@ -763,7 +855,16 @@ def main():
             filas += filas_red
             mejor = min(zip(epocas, filas_red), key=lambda par: par[1]["RMSE"])[0]
             elegidos_para_figura[mejor] = con_tabla(red(mejor, epocas[mejor]))
-            repetir_con_semillas(serie, mejor, epocas[mejor])
+            media, desv = repetir_con_semillas(serie, mejor, epocas[mejor])
+            rmse_clasico = next((f["RMSE"] for f in filas if f["modelo"] == NOMBRE_CLASICO), None)
+            if rmse_clasico is not None:
+                distancia = media - rmse_clasico
+                lectura = ("mayor que la desviación entre semillas ({:.3f}): la diferencia no se "
+                           "explica por la semilla" if abs(distancia) > desv else
+                           "menor que la desviación entre semillas ({:.3f}): la diferencia cabe "
+                           "en lo que varía la red con la semilla").format(desv)
+                print(f"  Distancia con el SARIMAX: {media:.3f} - {rmse_clasico:.2f} = "
+                      f"{distancia:+.3f}, {lectura}.")
         except NotImplementedError as error:
             pendiente("parte 4", error)
 
